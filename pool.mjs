@@ -349,6 +349,7 @@ function markFailure(account, status, retryAfterSec, message, logCtx) {
       outputTokens: 0,
       cachedTokens: 0,
       elapsedMs: logCtx.elapsedMs || 0,
+      ttftMs: logCtx.ttftMs || 0,
       error: message || `HTTP ${status}`,
     });
     bumpDaily(false, 0, 0);
@@ -357,7 +358,7 @@ function markFailure(account, status, retryAfterSec, message, logCtx) {
 }
 
 // ── 公开 API：用量与日志 ────────────────────────────
-export function proxyRecordUsage(ctx, { endpoint, model, status = 200, inputTokens = 0, outputTokens = 0, cachedTokens = 0, elapsedMs = 0, error = '' }) {
+export function proxyRecordUsage(ctx, { endpoint, model, status = 200, inputTokens = 0, outputTokens = 0, cachedTokens = 0, elapsedMs = 0, ttftMs = 0, error = '' }) {
   if (!ctx || !ctx.account || !state) return;
   const now = Date.now();
   const { account, vkey } = ctx;
@@ -386,6 +387,7 @@ export function proxyRecordUsage(ctx, { endpoint, model, status = 200, inputToke
     outputTokens,
     cachedTokens,
     elapsedMs,
+    ttftMs,
     error,
   });
   bumpDaily(status >= 200 && status < 400, inputTokens, outputTokens, { vkeyId: vkey && vkey.id, model, cachedTokens });

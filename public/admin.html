@@ -852,10 +852,15 @@
       }).join('') + '</tbody></table>';
   }
 
+  function fmtDur(ms) {
+    if (!ms || !isFinite(ms)) return '—';
+    if (ms < 1000) return Math.round(ms) + 'ms';
+    return (ms / 1000).toFixed(2) + 's';
+  }
   function logTable(rows, compact) {
     if (!rows.length) return '<div class="empty">' + (state.logFilter && state.logFilter.mode !== 'all' ? '该时间范围内暂无请求' : '暂无请求记录') + '</div>';
     return '<table><thead><tr>' +
-      '<th>时间</th>' + (compact ? '' : '<th>虚拟 Key</th>') + '<th>账号</th><th>端点</th><th>模型</th><th>状态</th><th class="num">Tokens (入/出)</th>' + (compact ? '' : '<th class="num">耗时</th>') + '<th>错误</th>' +
+      '<th>时间</th>' + (compact ? '' : '<th>虚拟 Key</th>') + '<th>账号</th><th>端点</th><th>模型</th><th>状态</th><th class="num">Tokens (入/出)</th>' + (compact ? '' : '<th class="num" title="首字 = 从请求发出到上游返回首个内容字节">首字</th>') + (compact ? '' : '<th class="num">总耗时</th>') + '<th>错误</th>' +
       '</tr></thead><tbody>' + rows.map(function (r) {
         var ok = r.status >= 200 && r.status < 400;
         var st = '<span class="badge ' + (ok ? 'ok' : (r.status === 429 ? 'warn' : 'err')) + '"><i></i>' + r.status + '</span>';
@@ -867,7 +872,8 @@
           '<td class="rowkey">' + esc(r.model) + '</td>' +
           '<td>' + st + '</td>' +
           '<td class="num">' + fmtNum(r.inputTokens) + ' / ' + fmtNum(r.outputTokens) + '</td>' +
-          (compact ? '' : '<td class="num">' + (r.elapsedMs ? (r.elapsedMs / 1000).toFixed(1) + 's' : '—') + '</td>') +
+          (compact ? '' : '<td class="num">' + fmtDur(r.ttftMs) + '</td>') +
+          (compact ? '' : '<td class="num">' + fmtDur(r.elapsedMs) + '</td>') +
           '<td>' + (r.error ? '<span class="errtext">' + esc(String(r.error).slice(0, 40)) + '</span>' : '<span class="mut">—</span>') + '</td>' +
           '</tr>';
       }).join('') + '</tbody></table>';

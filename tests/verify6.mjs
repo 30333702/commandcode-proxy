@@ -212,6 +212,11 @@ const tagOf = (r) => {
   const win = (await api('/admin/api/logs?from=' + (Date.now() - 60000) + '&to=' + (Date.now() + 60000))).body.data;
   check('from+to 双边界过滤生效', win.length === recent.length, `区间内=${win.length}`);
   check('日志按时间倒序（最新在前）', allLogs[0].t >= allLogs[allLogs.length - 1].t);
+  const withTtft = allLogs.filter((l) => typeof l.ttftMs === 'number' && typeof l.elapsedMs === 'number');
+  check('日志记录首字延迟（ttftMs 字段齐全）', withTtft.length === allLogs.length,
+    `有 ttftMs 的 ${withTtft.length}/${allLogs.length} 条`);
+  check('首字延迟不大于总耗时', withTtft.every((l) => l.ttftMs <= l.elapsedMs),
+    withTtft.slice(0, 3).map((l) => l.ttftMs + '/' + l.elapsedMs).join(' '));
 
   section('恢复环境');
   await api('/admin/api/settings', { method: 'PATCH', body: JSON.stringify({ strategy: 'round_robin' }) });

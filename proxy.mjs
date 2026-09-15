@@ -1125,10 +1125,10 @@ function retryAfterOf(headers) {
 
 function poolCtxOf(req) { return req._poolCtx || null; }
 
-function poolRecord(req, { endpoint, model, status = 200, inputTokens = 0, outputTokens = 0, cachedTokens = 0, elapsedMs = 0, error = '' }) {
+function poolRecord(req, { endpoint, model, status = 200, inputTokens = 0, outputTokens = 0, cachedTokens = 0, elapsedMs = 0, ttftMs = 0, error = '' }) {
   const ctx = poolCtxOf(req);
   if (!ctx) return;
-  proxyRecordUsage(ctx, { endpoint, model, status, inputTokens, outputTokens, cachedTokens, elapsedMs, error });
+  proxyRecordUsage(ctx, { endpoint, model, status, inputTokens, outputTokens, cachedTokens, elapsedMs, ttftMs: ttftMs < 0 ? 0 : ttftMs, error });
 }
 
 function poolFail(req, status, retryAfterSec, message) {
@@ -1142,7 +1142,7 @@ function poolNetFail(req) {
 }
 
 // 池子模式下把 usage 记账到「当前正被使用的账号」
-function poolTokens(req, endpoint, model, usage) {
+function poolTokens(req, endpoint, model, usage, elapsedMs = 0, ttftMs = 0) {
   if (usage) normalizeUsage(usage);
   poolRecord(req, {
     endpoint,
@@ -1151,6 +1151,8 @@ function poolTokens(req, endpoint, model, usage) {
     inputTokens: usage?.inputTokens ?? 0,
     outputTokens: usage?.outputTokens ?? 0,
     cachedTokens: usage?.cachedInputTokens ?? 0,
+    elapsedMs,
+    ttftMs,
   });
 }
 
@@ -1235,6 +1237,7 @@ async function handleChatCompletions(req, res) {
   // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
   const startTime = Date.now();
   let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0; let fullText = '';
+  let ttftMs = -1; // 首字延迟（-1 = 尚未收到上游数据；0 是合法测量值）
   let reader = null;
   let translator = null;
 
@@ -1248,7 +1251,7 @@ async function handleChatCompletions(req, res) {
     // 仅在尚未向客户端写过任何字节时进行；换号失败/不可用则走原有错误路径
     for (let attempt = 0; poolCtx && !ccResponse.ok && attempt < POOL_MAX_ATTEMPTS - 1; attempt++) {
       const next = proxyPickRetryAccount(poolCtx.account, ccResponse.status, retryAfterOf(ccResponse.headers), '', {
-        vkey: poolCtx.vkey && poolCtx.vkey.name, endpoint: '/v1/chat/completions', model, elapsedMs: Date.now() - startTime,
+        vkey: poolCtx.vkey && poolCtx.vkey.name, endpoint: '/v1/chat/completions', model, elapsedMs: Date.now() - startTime, ttftMs: ttftMs < 0 ? 0 : ttftMs,
       });
       if (!next) break;
       log('info', 'Pool failover', { path: '/v1/chat/completions', from: poolCtx.account.name, to: next.name, status: ccResponse.status });
@@ -1319,6 +1322,7 @@ async function handleChatCompletions(req, res) {
           if (done) break;
           if (aborted) break;
           bytesReceived += value.length;
+          if (ttftMs < 0) ttftMs = Date.now() - startTime;
 
           const chunkText = decoder.decode(value, { stream: true });
           buffer += chunkText;
@@ -1376,7 +1380,7 @@ async function handleChatCompletions(req, res) {
             try { res.write(`data: ${JSON.stringify(translator.upstreamError.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
           } else if (translator.outputTokens === 0) {
-            poolRecord(req, { endpoint: '/v1/chat/completions', model, status: 429, inputTokens: translator.inputTokens, cachedTokens: translator.cachedInputTokens, elapsedMs: Date.now() - startTime, error: 'zero output tokens' });
+            poolRecord(req, { endpoint: '/v1/chat/completions', model, status: 429, inputTokens: translator.inputTokens, cachedTokens: translator.cachedInputTokens, elapsedMs: Date.now() - startTime, ttftMs, error: 'zero output tokens' });
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) {
               sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
@@ -1384,7 +1388,7 @@ async function handleChatCompletions(req, res) {
             }
             try { res.write(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`); } catch {}
           } else {
-            poolRecord(req, { endpoint: '/v1/chat/completions', model, status: 200, inputTokens: translator.inputTokens, outputTokens: translator.outputTokens, cachedTokens: translator.cachedInputTokens, elapsedMs: Date.now() - startTime });
+            poolRecord(req, { endpoint: '/v1/chat/completions', model, status: 200, inputTokens: translator.inputTokens, outputTokens: translator.outputTokens, cachedTokens: translator.cachedInputTokens, elapsedMs: Date.now() - startTime, ttftMs });
             if (!started) {
               res.writeHead(200, {
                 'Content-Type': 'text/event-stream',
@@ -1507,6 +1511,7 @@ async function handleChatCompletions(req, res) {
         const { done, value } = result;
         if (done) break;
         bytesReceived += value.length;
+        if (ttftMs < 0) ttftMs = Date.now() - startTime;
         const chunkText = decoder.decode(value, { stream: true });
         buf += chunkText;
         // 无换行则不可能产生完整行，跳过全量 split（见 handleChatCompletions 流式段同处说明）
@@ -1529,7 +1534,7 @@ async function handleChatCompletions(req, res) {
       }
 
       consecutiveTimeouts = 0;
-      poolTokens(req, '/v1/chat/completions', model, usage);
+      poolTokens(req, '/v1/chat/completions', model, usage, Date.now() - startTime, ttftMs);
       sendJSON(res, 200, {
         id: completionId,
         object: 'chat.completion',
@@ -1905,6 +1910,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       const { done, value } = result;
       if (done) break;
       ctx.bytesReceived += value.length;
+      if (ctx.ttftMs < 0) ctx.ttftMs = Date.now() - ctx.startTime;
       const chunkText = decoder.decode(value, { stream: true });
       buffer += chunkText;
       // 同 handleChatCompletions：无换行即无完整行，跳过全量 split
@@ -2096,6 +2102,7 @@ async function handleMessages(req, res) {
   let messageId = '';
   let reader = null;
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
+  let ttftMs = -1; // 首字延迟（-1 = 尚未收到上游数据；0 是合法测量值）
 
   try {
     // 首次初始化（fingerprint + lifecycle）
@@ -2105,7 +2112,7 @@ async function handleMessages(req, res) {
     // ── 二开：池子模式下上游拒绝时换号重试（尚未向客户端写过字节）──
     for (let attempt = 0; poolCtx && !ccResponse.ok && attempt < POOL_MAX_ATTEMPTS - 1; attempt++) {
       const next = proxyPickRetryAccount(poolCtx.account, ccResponse.status, retryAfterOf(ccResponse.headers), '', {
-        vkey: poolCtx.vkey && poolCtx.vkey.name, endpoint: '/v1/messages', model, elapsedMs: Date.now() - startTime,
+        vkey: poolCtx.vkey && poolCtx.vkey.name, endpoint: '/v1/messages', model, elapsedMs: Date.now() - startTime, ttftMs: ttftMs < 0 ? 0 : ttftMs,
       });
       if (!next) break;
       log('info', 'Pool failover', { path: '/v1/messages', from: poolCtx.account.name, to: next.name, status: ccResponse.status });
@@ -2188,7 +2195,7 @@ async function handleMessages(req, res) {
       let ctx;
       try {
         messageId = 'msg_' + randomUUID().slice(0, 12);
-        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null };
+        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null, startTime, ttftMs: -1 };
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
@@ -2217,7 +2224,7 @@ async function handleMessages(req, res) {
             }
             // started 时 error 事件已在循环中经 SSE 下发，按规范 error 事件即终结
           } else if (ctx.outputTokens === 0) {
-            poolRecord(req, { endpoint: '/v1/messages', model, status: 429, inputTokens: ctx.inputTokens, cachedTokens: ctx.cachedInputTokens, elapsedMs: Date.now() - startTime, error: 'zero output tokens' });
+            poolRecord(req, { endpoint: '/v1/messages', model, status: 429, inputTokens: ctx.inputTokens, cachedTokens: ctx.cachedInputTokens, elapsedMs: Date.now() - startTime, ttftMs: ctx.ttftMs, error: 'zero output tokens' });
             try { abortController.abort(); } catch {}
             if (!started) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
@@ -2225,7 +2232,7 @@ async function handleMessages(req, res) {
             }
             await flushBuf();
           } else {
-            poolRecord(req, { endpoint: '/v1/messages', model, status: 200, inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens, cachedTokens: ctx.cachedInputTokens, elapsedMs: Date.now() - startTime });
+            poolRecord(req, { endpoint: '/v1/messages', model, status: 200, inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens, cachedTokens: ctx.cachedInputTokens, elapsedMs: Date.now() - startTime, ttftMs: ctx.ttftMs });
             await flushBuf();
           }
         }
@@ -2343,6 +2350,7 @@ async function handleMessages(req, res) {
         const { done, value } = result;
         if (done) break;
         bytesReceived += value.length;
+        if (ttftMs < 0) ttftMs = Date.now() - startTime;
         const chunkText = decoder.decode(value, { stream: true });
         buf += chunkText;
         // 无换行则不可能产生完整行，跳过全量 split
@@ -2366,7 +2374,7 @@ async function handleMessages(req, res) {
       }
 
       consecutiveTimeouts = 0;
-      poolTokens(req, '/v1/messages', model, usage);
+      poolTokens(req, '/v1/messages', model, usage, Date.now() - startTime, ttftMs);
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
   } catch (e) {
@@ -2903,6 +2911,7 @@ async function handleResponses(req, res) {
   const startTime = Date.now();
   let bytesReceived = 0;
   let lastCcEvent = '';
+  let ttftMs = -1; // 首字延迟（-1 = 尚未收到上游数据；0 是合法测量值）
   let reader = null;
   let translator = null;
 
@@ -2923,7 +2932,7 @@ async function handleResponses(req, res) {
     // ── 二开：池子模式下上游拒绝时换号重试（尚未向客户端写过字节）──
     for (let attempt = 0; poolCtx && !ccResponse.ok && attempt < POOL_MAX_ATTEMPTS - 1; attempt++) {
       const next = proxyPickRetryAccount(poolCtx.account, ccResponse.status, retryAfterOf(ccResponse.headers), '', {
-        vkey: poolCtx.vkey && poolCtx.vkey.name, endpoint: '/v1/responses', model, elapsedMs: Date.now() - startTime,
+        vkey: poolCtx.vkey && poolCtx.vkey.name, endpoint: '/v1/responses', model, elapsedMs: Date.now() - startTime, ttftMs: ttftMs < 0 ? 0 : ttftMs,
       });
       if (!next) break;
       log('info', 'Pool failover', { path: '/v1/responses', from: poolCtx.account.name, to: next.name, status: ccResponse.status });
@@ -2969,6 +2978,7 @@ async function handleResponses(req, res) {
           if (done) break;
           if (aborted || res.destroyed) break;
           bytesReceived += value.length;
+          if (ttftMs < 0) ttftMs = Date.now() - startTime;
 
           const chunkText = decoder.decode(value, { stream: true });
           buffer += chunkText;
@@ -3006,7 +3016,7 @@ async function handleResponses(req, res) {
               'Empty response from upstream (zero output tokens)', 10);
             return;
           } else {
-            poolRecord(req, { endpoint: '/v1/responses', model, status: 200, inputTokens: translator.inputTokens ?? 0, outputTokens: translator.outputTokens ?? 0, cachedTokens: translator.cachedInputTokens ?? 0, elapsedMs: Date.now() - startTime });
+            poolRecord(req, { endpoint: '/v1/responses', model, status: 200, inputTokens: translator.inputTokens ?? 0, outputTokens: translator.outputTokens ?? 0, cachedTokens: translator.cachedInputTokens ?? 0, elapsedMs: Date.now() - startTime, ttftMs });
             if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }
             for (const e2 of translator.finish()) res.write(e2);
           }
@@ -3104,6 +3114,7 @@ async function handleResponses(req, res) {
         const value = result.value;
         if (done) break;
         bytesReceived += value.length;
+        if (ttftMs < 0) ttftMs = Date.now() - startTime;
         const chunkText = decoder.decode(value, { stream: true });
         buf += chunkText;
         if (chunkText.indexOf('\n') !== -1) processLines();
@@ -3126,7 +3137,7 @@ async function handleResponses(req, res) {
       }
 
       consecutiveTimeouts = 0;
-      poolTokens(req, '/v1/responses', model, usage);
+      poolTokens(req, '/v1/responses', model, usage, Date.now() - startTime, ttftMs);
       echoOpts.finishReason = finishReason;
       sendJSON(res, 200, buildResponsesObject(
         responseId, model, created, fullText, thinkingText, toolCalls, usage, echoOpts));

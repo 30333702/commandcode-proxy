@@ -174,6 +174,13 @@ const apiResponses = {
       { id: 'acc_2', name: '未刷新号', enabled: true, status: 'active' },
     ],
   },
+  logs: {
+    ok: true,
+    data: [
+      { t: now - 5000, vkey: '主Key', account: '主号A', endpoint: '/v1/chat/completions', model: 'deepseek/deepseek-v4-flash', status: 200, inputTokens: 120, outputTokens: 45, cachedTokens: 0, elapsedMs: 26360, ttftMs: 9810, error: '' },
+      { t: now - 60000, vkey: '主Key', account: '主号B', endpoint: '/v1/messages', model: 'claude-sonnet-4-6', status: 200, inputTokens: 88, outputTokens: 12, cachedTokens: 0, elapsedMs: 640, ttftMs: 310, error: '' },
+    ],
+  },
 };
 async function fetchStub(url) {
   const path = String(url).replace('/admin/api/', '');
@@ -355,6 +362,10 @@ await new Promise((r) => setTimeout(r, 250));
 // 快捷档与日期输入是静态 HTML，由 check-ui 的锚点检查覆盖；这里验证动态渲染
 check('条数统计已渲染（不再固定 100 条）', /共 [\d,]+ 条/.test(els.get('logCount').textContent || ''), els.get('logCount').textContent);
 check('日志表格渲染', (els.get('logWrap').innerHTML || '').includes('<table>') || (els.get('logWrap').innerHTML || '').includes('暂无'));
+check('首字列存在（带解释 title）', /<th class="num" title="[^"]*首字[^"]*"/.test(els.get('logWrap').innerHTML || ''));
+const logHtml2 = els.get('logWrap').innerHTML || '';
+check('首字与总耗时按秒两位显示（9.81s / 26.36s）', logHtml2.includes('>9.81s<') && logHtml2.includes('>26.36s<'));
+check('亚秒值显示毫秒（310ms / 640ms）', logHtml2.includes('>310ms<') && logHtml2.includes('>640ms<'));
 
 console.log(out.join('\n'));
 console.log(`\n──────────────\n通过 ${pass} / ${pass + fail}${fail ? `，失败 ${fail}` : '，全部通过'}`);
