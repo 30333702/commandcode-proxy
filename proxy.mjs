@@ -9,6 +9,13 @@ import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
+// ── 二开：多账号池 + 管理面板 ──────────────────────
+import {
+  poolResolveClientKey, proxyPickRetryAccount, proxyNoteUpstreamFailure,
+  proxyRecordUsage, poolAccountCount, proxyReleaseAccount, proxySwapAccount,
+} from './pool.mjs';
+import { handleAdmin } from './admin.mjs';
+
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -1047,7 +1054,104 @@ function getApiKey(headers) {
     const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
     if (match) return match[0];
   }
+  // Google SDK style
+  const goog = headers['x-goog-api-key'] || headers['X-Goog-Api-Key'] || '';
+  if (goog) {
+    const match = goog.match(/user_[a-zA-Z0-9_-]+/);
+    if (match) return match[0];
+  }
   return null;
+}
+
+// ── 二开：账号池集成层 ──────────────────────────────
+// 虚拟 Key（sk-ccp-*）→ 池子选号；user_* Key → 原有透传行为（保持不变）
+const POOL_MAX_ATTEMPTS = 3;
+
+// 兼容三种客户端习惯：OpenAI/Anthropic 用 Authorization/x-api-key，Google SDK 用 x-goog-api-key
+function extractRawKey(headers) {
+  const auth = headers['authorization'] || headers['Authorization'] || '';
+  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  const xKey = (headers['x-api-key'] || headers['X-Api-Key'] || '').trim();
+  if (xKey) return xKey;
+  return (headers['x-goog-api-key'] || headers['X-Goog-Api-Key'] || '').trim();
+}
+
+function resolveRequestKey(req, res) {
+  const raw = extractRawKey(req.headers);
+  if (raw && raw.startsWith('sk-ccp-')) {
+    const r = poolResolveClientKey(raw);
+    if (r.error) return { poolError: r.error };
+    req._poolCtx = r;
+    // 释放该账号占用的在途额度：响应写完或连接终止，取先到者且幂等
+    if (res) {
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        proxyReleaseAccount(r);
+        req._poolCtx = null;
+      };
+      res.once('finish', release);
+      res.once('close', release);
+    }
+    return { apiKey: r.account.key, poolCtx: r };
+  }
+  return { apiKey: getApiKey(req.headers), poolCtx: null };
+}
+
+function sendPoolError(res, pe) {
+  const body = { error: { message: pe.message, type: pe.type } };
+  if (pe.retryAfter) body.retry_after = pe.retryAfter;
+  if (pe.retryAfter) res.setHeader('Retry-After', String(pe.retryAfter));
+  sendJSON(res, pe.status, body);
+}
+
+function sendPoolErrorAnthropic(res, pe) {
+  sendAnthropicError(res, pe.status, pe.type === 'auth_error' ? 'authentication_error' : pe.type, pe.message, pe.retryAfter);
+}
+
+function sendPoolErrorResponses(res, pe) {
+  sendResponsesError(res, pe.status, pe.type, pe.message, pe.retryAfter);
+}
+
+function retryAfterOf(headers) {
+  try {
+    const v = Number(headers?.get?.('retry-after'));
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function poolCtxOf(req) { return req._poolCtx || null; }
+
+function poolRecord(req, { endpoint, model, status = 200, inputTokens = 0, outputTokens = 0, cachedTokens = 0, elapsedMs = 0, error = '' }) {
+  const ctx = poolCtxOf(req);
+  if (!ctx) return;
+  proxyRecordUsage(ctx, { endpoint, model, status, inputTokens, outputTokens, cachedTokens, elapsedMs, error });
+}
+
+function poolFail(req, status, retryAfterSec, message) {
+  const ctx = poolCtxOf(req);
+  if (ctx) proxyNoteUpstreamFailure(ctx.account, status, retryAfterSec, message);
+}
+
+function poolNetFail(req) {
+  const ctx = poolCtxOf(req);
+  if (ctx) proxyNoteNetworkFailure(ctx.account);
+}
+
+// 池子模式下把 usage 记账到「当前正被使用的账号」
+function poolTokens(req, endpoint, model, usage) {
+  if (usage) normalizeUsage(usage);
+  poolRecord(req, {
+    endpoint,
+    model,
+    status: 200,
+    inputTokens: usage?.inputTokens ?? 0,
+    outputTokens: usage?.outputTokens ?? 0,
+    cachedTokens: usage?.cachedInputTokens ?? 0,
+  });
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -1108,11 +1212,14 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const keyRes = resolveRequestKey(req, res);
+  if (keyRes.poolError) { sendPoolError(res, keyRes.poolError); return; }
+  if (!keyRes.apiKey) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
+  let apiKey = keyRes.apiKey;
+  const poolCtx = keyRes.poolCtx;
 
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
@@ -1135,12 +1242,27 @@ async function handleChatCompletions(req, res) {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+
+    // ── 二开：池子模式下被上游拒绝（401/402/403/429/5xx）时换号重试 ──
+    // 仅在尚未向客户端写过任何字节时进行；换号失败/不可用则走原有错误路径
+    for (let attempt = 0; poolCtx && !ccResponse.ok && attempt < POOL_MAX_ATTEMPTS - 1; attempt++) {
+      const next = proxyPickRetryAccount(poolCtx.account, ccResponse.status, retryAfterOf(ccResponse.headers), '', {
+        vkey: poolCtx.vkey && poolCtx.vkey.name, endpoint: '/v1/chat/completions', model, elapsedMs: Date.now() - startTime,
+      });
+      if (!next) break;
+      log('info', 'Pool failover', { path: '/v1/chat/completions', from: poolCtx.account.name, to: next.name, status: ccResponse.status });
+      proxySwapAccount(poolCtx, next);
+      apiKey = next.key;
+      await ensureInitialized(apiKey, abortController.signal);
+      ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    }
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
       log('error', 'CC API error', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
+      poolFail(req, ccResponse.status, mapped.body?.retry_after || 0, mapped.body?.error?.message || '');
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
@@ -1254,6 +1376,7 @@ async function handleChatCompletions(req, res) {
             try { res.write(`data: ${JSON.stringify(translator.upstreamError.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
           } else if (translator.outputTokens === 0) {
+            poolRecord(req, { endpoint: '/v1/chat/completions', model, status: 429, inputTokens: translator.inputTokens, cachedTokens: translator.cachedInputTokens, elapsedMs: Date.now() - startTime, error: 'zero output tokens' });
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) {
               sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
@@ -1261,6 +1384,7 @@ async function handleChatCompletions(req, res) {
             }
             try { res.write(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`); } catch {}
           } else {
+            poolRecord(req, { endpoint: '/v1/chat/completions', model, status: 200, inputTokens: translator.inputTokens, outputTokens: translator.outputTokens, cachedTokens: translator.cachedInputTokens, elapsedMs: Date.now() - startTime });
             if (!started) {
               res.writeHead(200, {
                 'Content-Type': 'text/event-stream',
@@ -1398,12 +1522,14 @@ async function handleChatCompletions(req, res) {
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
+        poolRecord(req, { endpoint: '/v1/chat/completions', model, status: 429, inputTokens: usage?.inputTokens ?? 0, elapsedMs: Date.now() - startTime, error: 'zero output tokens' });
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
         return;
       }
 
       consecutiveTimeouts = 0;
+      poolTokens(req, '/v1/chat/completions', model, usage);
       sendJSON(res, 200, {
         id: completionId,
         object: 'chat.completion',
@@ -1947,11 +2073,14 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const keyRes = resolveRequestKey(req, res);
+  if (keyRes.poolError) { sendPoolErrorAnthropic(res, keyRes.poolError); return; }
+  if (!keyRes.apiKey) {
     sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
   }
+  let apiKey = keyRes.apiKey;
+  const poolCtx = keyRes.poolCtx;
 
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
@@ -1971,12 +2100,26 @@ async function handleMessages(req, res) {
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+
+    // ── 二开：池子模式下上游拒绝时换号重试（尚未向客户端写过字节）──
+    for (let attempt = 0; poolCtx && !ccResponse.ok && attempt < POOL_MAX_ATTEMPTS - 1; attempt++) {
+      const next = proxyPickRetryAccount(poolCtx.account, ccResponse.status, retryAfterOf(ccResponse.headers), '', {
+        vkey: poolCtx.vkey && poolCtx.vkey.name, endpoint: '/v1/messages', model, elapsedMs: Date.now() - startTime,
+      });
+      if (!next) break;
+      log('info', 'Pool failover', { path: '/v1/messages', from: poolCtx.account.name, to: next.name, status: ccResponse.status });
+      proxySwapAccount(poolCtx, next);
+      apiKey = next.key;
+      await ensureInitialized(apiKey, abortController.signal);
+      ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    }
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
       log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
+      poolFail(req, ccResponse.status, mapped.body?.retry_after || 0, mapped.body?.error?.message || '');
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
@@ -2074,6 +2217,7 @@ async function handleMessages(req, res) {
             }
             // started 时 error 事件已在循环中经 SSE 下发，按规范 error 事件即终结
           } else if (ctx.outputTokens === 0) {
+            poolRecord(req, { endpoint: '/v1/messages', model, status: 429, inputTokens: ctx.inputTokens, cachedTokens: ctx.cachedInputTokens, elapsedMs: Date.now() - startTime, error: 'zero output tokens' });
             try { abortController.abort(); } catch {}
             if (!started) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
@@ -2081,6 +2225,7 @@ async function handleMessages(req, res) {
             }
             await flushBuf();
           } else {
+            poolRecord(req, { endpoint: '/v1/messages', model, status: 200, inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens, cachedTokens: ctx.cachedInputTokens, elapsedMs: Date.now() - startTime });
             await flushBuf();
           }
         }
@@ -2214,12 +2359,14 @@ async function handleMessages(req, res) {
       // 零输出判定改为按实际内容：上游偶发不回 totalUsage 时，旧逻辑（usage?.outputTokens ?? 0 === 0）
       // 会把有完整文本的响应误杀成 429
       if (!fullText && !thinkingText && !toolCalls) {
+        poolRecord(req, { endpoint: '/v1/messages', model, status: 429, inputTokens: usage?.inputTokens ?? 0, elapsedMs: Date.now() - startTime, error: 'zero output tokens' });
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
         return;
       }
 
       consecutiveTimeouts = 0;
+      poolTokens(req, '/v1/messages', model, usage);
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
   } catch (e) {
@@ -2718,12 +2865,15 @@ async function handleResponses(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  const keyRes = resolveRequestKey(req, res);
+  if (keyRes.poolError) { sendPoolErrorResponses(res, keyRes.poolError); return; }
+  if (!keyRes.apiKey) {
     sendResponsesError(res, 401, 'authentication_error',
       'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
     return;
   }
+  let apiKey = keyRes.apiKey;
+  const poolCtx = keyRes.poolCtx;
 
   let chatReq = convertResponsesToChat(respReq);
   if (!chatReq.messages.length) {
@@ -2768,12 +2918,26 @@ async function handleResponses(req, res) {
 
   try {
     await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+
+    // ── 二开：池子模式下上游拒绝时换号重试（尚未向客户端写过字节）──
+    for (let attempt = 0; poolCtx && !ccResponse.ok && attempt < POOL_MAX_ATTEMPTS - 1; attempt++) {
+      const next = proxyPickRetryAccount(poolCtx.account, ccResponse.status, retryAfterOf(ccResponse.headers), '', {
+        vkey: poolCtx.vkey && poolCtx.vkey.name, endpoint: '/v1/responses', model, elapsedMs: Date.now() - startTime,
+      });
+      if (!next) break;
+      log('info', 'Pool failover', { path: '/v1/responses', from: poolCtx.account.name, to: next.name, status: ccResponse.status });
+      proxySwapAccount(poolCtx, next);
+      apiKey = next.key;
+      await ensureInitialized(apiKey, abortController.signal);
+      ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    }
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
       log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
+      poolFail(req, ccResponse.status, mapped.body?.retry_after || 0, mapped.body?.error?.message || '');
       sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
     }
@@ -2836,11 +3000,13 @@ async function handleResponses(req, res) {
             const failed = translator.fail(translator.upstreamError.body.error.message);
             if (failed.length) await writeEvents(failed);
           } else if (translator.outputTokens === 0 && !translator.started) {
+            poolRecord(req, { endpoint: '/v1/responses', model, status: 429, inputTokens: translator.inputTokens ?? 0, elapsedMs: Date.now() - startTime, error: 'zero output tokens' });
             try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
             sendResponsesError(res, 429, 'rate_limit_error',
               'Empty response from upstream (zero output tokens)', 10);
             return;
           } else {
+            poolRecord(req, { endpoint: '/v1/responses', model, status: 200, inputTokens: translator.inputTokens ?? 0, outputTokens: translator.outputTokens ?? 0, cachedTokens: translator.cachedInputTokens ?? 0, elapsedMs: Date.now() - startTime });
             if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }
             for (const e2 of translator.finish()) res.write(e2);
           }
@@ -2952,6 +3118,7 @@ async function handleResponses(req, res) {
       }
 
       if (!fullText && !thinkingText && !toolCalls.length) {
+        poolRecord(req, { endpoint: '/v1/responses', model, status: 429, inputTokens: usage?.inputTokens ?? 0, elapsedMs: Date.now() - startTime, error: 'zero output tokens' });
         try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
         sendResponsesError(res, 429, 'rate_limit_error',
           'Empty response from upstream (zero output tokens)', 10);
@@ -2959,6 +3126,7 @@ async function handleResponses(req, res) {
       }
 
       consecutiveTimeouts = 0;
+      poolTokens(req, '/v1/responses', model, usage);
       echoOpts.finishReason = finishReason;
       sendJSON(res, 200, buildResponsesObject(
         responseId, model, created, fullText, thinkingText, toolCalls, usage, echoOpts));
@@ -2976,8 +3144,9 @@ async function handleResponses(req, res) {
 }
 
 async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
-  const models = await fetchModels(apiKey);
+  const keyRes = resolveRequestKey(req, res);
+  if (keyRes.poolError) { sendPoolError(res, keyRes.poolError); return; }
+  const models = await fetchModels(keyRes.apiKey);
   const now = nowUnix();
   sendJSON(res, 200, {
     object: 'list',
@@ -3011,8 +3180,9 @@ const server = http.createServer(async (req, res) => {
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
 
-  // 在途上限准入。/health 与 / 例外：探活与编排器不该因业务繁忙而收 503。
-  const isLiveness = url.pathname === '/health' || url.pathname === '/';
+  // 在途上限准入。/health、/ 与 /admin 例外：探活、编排器与本地面板不该因业务繁忙而收 503。
+  const isLiveness = url.pathname === '/health' || url.pathname === '/'
+    || url.pathname === '/admin' || url.pathname.startsWith('/admin/');
   if (!isLiveness && MAX_INFLIGHT > 0) {
     if (inflightCount >= MAX_INFLIGHT) {
       log('warn', 'In-flight limit reached, rejecting request', {
@@ -3038,7 +3208,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
+    // ── 二开：管理面板（/admin 页面 + /admin/api/* 接口）──
+    if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
+      await handleAdmin(req, res, url);
+    } else if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       await handleChatCompletions(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
       await handleMessages(req, res);
@@ -3078,6 +3251,9 @@ server.listen(CFG.port, CFG.host, () => {
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
+    pool: poolAccountCount() > 0
+      ? `enabled (${poolAccountCount()} upstream accounts) — admin panel: http://${CFG.host}:${CFG.port}/admin`
+      : `empty — add upstream accounts at http://${CFG.host}:${CFG.port}/admin`,
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });

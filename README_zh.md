@@ -1,5 +1,7 @@
 # Command Code Proxy
 
+<p align="center"><img src="docs/logo.svg" width="88" alt="CCPool — 多账号池反代"></p>
+
 > [English Docs](README.md)
 
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
@@ -366,7 +368,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli` |
 | **Project Slug** | `x-project-slug` = `slugify(process.cwd())`，与 `config.workingDir` 同源 |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
-| **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
+| **API Key 格式验证** | 对 `Authorization: Bearer`、`x-api-key` 或 `x-goog-api-key`（Google SDK 风格）用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
 | **零输出防护** | outputTokens=0 → 429 `rate_limit_error`（SDK 自动重试，反异常计费） |
@@ -424,6 +426,8 @@ CLI 发送图片的格式：
 
 ## Docker 部署
 
+> **注意**：下方 GHCR 镜像 `ghcr.io/maxeaglet/commandcode-proxy` 由**上游仓库**的 Actions 构建，是**原版代理**，不含本二开的多账号池与管理面板。要跑二开版本请用[从源码构建](#从源码构建)或自行构建镜像。
+
 ### 从 GHCR 拉取
 
 每次打 `v*` tag 时 GitHub Actions 会自动构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry：
@@ -441,7 +445,7 @@ docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/comman
 docker compose up -d
 ```
 
-代理将在 `http://0.0.0.0:3050` 监听。通过 `PROXY_PORT` 自定义主机端口：
+代理将在 `http://0.0.0.0:3050` 监听。compose 已把命名卷 `ccpool-data` 挂到容器的 `/app/data`，账号池状态（账号、虚拟 Key、统计、额度缓存、面板密码）会跨容器重建保留。通过 `PROXY_PORT` 自定义主机端口：
 
 ```bash
 PROXY_PORT=13050 docker compose up -d
@@ -451,8 +455,12 @@ PROXY_PORT=13050 docker compose up -d
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
+  -v ccpool-data:/app/data \
+  commandcode-proxy:latest
 ```
+
+镜像内 `/app/data` 是账号池状态目录（由 `CCPOOL_DATA_DIR` 指定）。**务必挂卷**，否则容器重建时账号池、虚拟 Key 与统计会一起丢失。
 
 ### 多架构构建
 
@@ -466,6 +474,7 @@ npm run docker:build:multi
 |------|--------|------|
 | `PORT` | `3050` | 容器内监听端口 |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
+| `CCPOOL_DATA_DIR` | `./data`（镜像内为 `/app/data`）| 账号池状态目录，见[数据与安全](#数据与安全) |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
@@ -618,6 +627,225 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 ---
 
 [Linux.do](https://linux.do)
+
+## 多账号池与管理面板（二开）
+
+> 本节描述本仓库相对上游 [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy) 的二次开发内容。
+> 原有的 OpenAI / Anthropic / Responses 兼容端点、上游协议对齐、指纹伪装、超时与背压逻辑**未做修改**。
+
+### 它解决什么问题
+
+原版是「纯反代」：调用方每次请求自带一个 `user_*` 上游 Key，一个客户端 = 一个账号。
+本二开在此基础上增加了**账号池**与**面板**：
+
+- **多账号池**：把多个 `user_*` Key 收进池子，对下游只暴露虚拟 Key（`sk-ccp-*`）
+- **自动调度**：按策略轮询选号，不可用账号（禁用 / 异常 / 冷却中）自动跳过
+- **故障转移**：上游返回 401/402/403/429/5xx 时，自动换一个账号重试（客户端无感知）
+- **健康状态机**：Key 失效自动禁用，限流自动冷却，冷却到期自动恢复
+- **用量统计**：账号级 / 虚拟 Key 级 / 天级 token 与请求数统计，保留 30 天
+- **Web 面板**：账号管理、虚拟 Key 发放、请求日志、调度设置、密码管理
+
+### 快速开始
+
+```bash
+npm start
+```
+
+启动后：
+
+1. 浏览器打开 `http://127.0.0.1:3050/admin`（端口同代理，路径 `/admin`）
+2. 首次登录密码为 `admin123`（**登录后请立即到「设置」修改**）
+3. 在「上游账号池」粘贴一个或多个 `user_*` Key（每行一个，支持批量）
+4. 在「虚拟 Key」创建一个 `sk-ccp-*` Key
+5. 客户端把 Base URL 指向本服务，API Key 填该虚拟 Key
+
+代理启动日志会打印池子状态：
+
+```
+[info] CC Proxy started {... "pool":"enabled (3 upstream accounts) — admin panel: http://0.0.0.0:3050/admin"}
+```
+
+### 客户端接入
+
+```bash
+curl http://127.0.0.1:3050/v1/chat/completions \
+  -H "Authorization: Bearer sk-ccp-xxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Anthropic SDK 用 `x-api-key: sk-ccp-...`，Base URL 指向 `http://127.0.0.1:3050`。
+`/v1/messages`、`/v1/responses`、`/v1/models` 行为与接入方式同原版。
+
+**向后兼容**：请求头里直接传上游 `user_*` Key 依然可用，此时请求**不经过池子**（等同于原版行为），也不计入池子统计。两种模式可以并存。
+
+### 调度与容错
+
+| 机制 | 说明 | 面板可配置 |
+|------|------|-----------|
+| 调度策略 | `round_robin`（默认）/ `least_used` / `random` / `sticky` | 是 |
+| 限流冷却 | 402/429 → 账号暂停，时长取上游 `Retry-After`，缺省用配置值（默认 60s） | 是 |
+| 网络冷却 | 5xx / 连接失败 → 短冷却（默认 30s） | 是 |
+| 认证失败 | 401/403 → 标记 `Key 异常`，可选自动禁用 | 是 |
+| 换号重试 | 上游拒绝时最多换 3 个账号重试（仅在尚未向客户端写数据时） | 固定 |
+| 冷却恢复 | 冷却到期自动回到可用状态；也可在面板手动「重置」 | — |
+| 单账号并发上限 | 限制同一账号的同时在途请求数，超出返回 503 + 短重试提示，交由客户端 SDK 退避重试 | 是 |
+| 单账号派发间隔 | 同一账号两次请求的最小间隔，贴近正常 CLI 使用频率以降低风控风险 | 是 |
+| 额度耗尽跳过 | 额度数据显示任一滚动窗口 `exceeded` 或月度余额归零的账号直接不参与选号；全池耗尽时返回 503，`Retry-After` 取最近的窗口重置点 | 自动 |
+
+**选号过滤**：所有策略共用一个可用池——禁用、`Key 异常`、冷却中、达到单账号并发上限、未到派发间隔的账号，以及本轮重试中刚失败的那个账号，都不参与选号。
+
+**四种策略的取舍**：
+
+| 策略 | 选号方式 | 适用场景 |
+|------|----------|----------|
+| `round_robin` | 全局游标在账号列表上轮转，跳过不可用账号 | 默认；想让用量均匀摊到所有账号 |
+| `least_used` | 取累计请求数最少的账号 | 账号额度差异大，想先榨干用得少的 |
+| `random` | 随机 | 不想有明显轮转规律 |
+| `sticky` | 同一虚拟 Key 固定复用上次的账号；该账号不可用或**额度耗尽**时才换号并转移绑定 | 在意 prompt 缓存命中与对话连续性 |
+
+**关于粘性**：上游按账号维度维护会话与 prompt 缓存。轮询意味着同一客户端的连续请求散到不同账号，每个账号都要重新预热缓存——省不了钱也慢一截。`sticky` 把同一个虚拟 Key 钉在一个账号上保缓存命中，代价是用量集中在少数账号上（更容易先撞到窗口限额）。绑定的账号被禁用/冷却/**额度耗尽**时不会阻塞请求，会自动换号并把绑定一起转移过去；原账号恢复后也不会自动回切（否则会反复撞刚失败的账号）。绑定随虚拟 Key 持久化，重启进程后仍生效。
+
+**手动切换与取消**：额度卡片上每个账号都有「粘住」按钮（只有一个启用 Key 时是快捷开关；有多个 Key 时提示到「虚拟 Key」页逐个指定）。「虚拟 Key」页的「粘性账号」列是**下拉框**，这才是主入口：选某个账号 = 该 Key 固定走它；选「不粘（每次按策略调度）」= **取消粘性**。`PATCH /admin/api/vkeys/:id` 的 `lastAccountId` 字段（传空串解绑）。
+
+**「取消粘性」是持久状态，不是清空一次**：解绑会把该 Key 标记为 `stickyOff`，此后 sticky 策略**不再自动回写**绑定——否则下一次请求又会把绑定粘回来，用户看到的就是「点了取消没用」。重新在下拉里指定账号即恢复粘性（`stickyOff` 复位）。这一点在 `verify6` 里有专门的回归用例守着。
+
+零输出与上游空闲超时**不冷却账号**：这两类现象多为模型侧或请求侧问题（见上文[上游空闲超时](#上游空闲超时)），冷却账号只会让池子整体不可用。它们仍会记录到请求日志。
+
+虚拟 Key 支持**请求配额**与**有效期**，超额返回 `429`，过期/禁用返回 `401`。
+
+### 面板功能
+
+- **仪表盘**：今日请求与 tokens、可用账号数、状态分布、近 7 日请求曲线、最近请求
+- **用量限额**：每个上游账号一张额度卡，含 5 小时 / 周 / 月度三条进度条与重置倒计时（见下节）
+- **上游账号池**：批量添加、启用/禁用、单个测试连通性、一键测试全部、重置状态、删除
+- **虚拟 Key**：创建（名称/配额/有效期）、一键复制、启用/禁用、删除、配额进度
+- **请求日志**：时间、虚拟 Key、账号、端点、模型、状态码、token 明细、耗时、错误；全部展示（内存保留 2 万条，重启后仍保留 3 千条），顶部可按「今天 / 昨天 / 近24小时 / 近 7 天 / 近 14 天 / 近 30 天 / 本月 / 上月」一键筛选，或用开始/结束日期自定义区间（接口：`GET /admin/api/logs?from=<ms>&to=<ms>`，均含边界，省略即不过滤）
+- **设置**：调度策略、冷却时长、自动禁用、单账号并发/节流、额度自动刷新间隔、修改管理密码
+
+### 用量限额（Usage Limits）
+
+仪表盘以卡片矩阵展示每个上游账号的额度，形态对齐官方用量面板。百分比与进度条都以**剩余**为主视角（剩余越多条越长），颜色则按已用比例分级，一眼能看出哪个账号快用满：
+
+```
+主账号  [Go]                       详情  刷新  删除
+月度剩余 4.1    充值余额 0    免费额度 0
+5-Hour Limit                     剩余 89.8%
+███████████████████████░░
+已用 0.4 / 3                   剩余 2.6 · 3 小时 56 分钟后重置
+Weekly Limit                     剩余 3.2%
+█░░░░░░░░░░░░░░░░░░░░░░░░░
+已用 5.8 / 6                   剩余 0.2 · 5 天 0 小时后重置
+Monthly Limit                    剩余 41.9%   上限按套餐推算
+███████████░░░░░░░░░░░░░░░
+已用 5.8 / 10                  剩余 4.2 · 28 天 0 小时后重置
+```
+
+点「详情」展开该账号的账期统计（数据来自 `/alpha/usage/summary`）：累计请求、成功率、成功 / 失败、累计消耗 credits、Tokens 进 / 出、单均成本、统计口径（如 `billing-period`）。
+卡片还提供「粘住 / 取消粘住」（手动指定虚拟 Key 的粘性账号，见[调度与容错](#调度与容错)）、「刷新」（重新拉取该账号额度）与「删除」。**添加账号后后端会自动为新账号拉取一次额度**，几秒后卡片即有数据，无需手动刷新。
+
+**窗口耗尽预测**：5 小时与周窗口会按「窗口内平均消耗速率」推算何时打满（`预计 2 小时 24 分钟后打满`，参考 CLIProxyAPI 生态的 run-rate forecast 做法）。只在按当前速率撑不到窗口结束、且窗口已过 5 分钟（样本足够）时才显示；月度按账期推算，账期长度不固定所以不做预测。
+
+### 用量分布（按 Key / 按模型）
+
+仪表盘「用量分布」面板把近 7 日请求按**虚拟 Key** 与**模型**两个维度排行（可切换）：请求数、成功率、tokens 量，条形长度按占比。数据由 `state.daily` 的维度聚合产生——每个自然日记录 `byKey` / `byModel` 桶，只保留 7 天，不需要额外数据库。
+
+### 账号批量运维
+
+账号页顶部提供三个批量操作，账号多时不用逐个点：
+
+| 操作 | 行为 |
+| --- | --- |
+| 全部启用 | 启用所有账号并清空冷却与错误标记 |
+| 全部禁用 | 禁用所有账号（池子停止派发，需确认） |
+| 清理失效 | 删除所有「已禁用且 Key 异常（401/403）」的账号；删除时会自动解绑指向它们的粘性绑定 |
+
+对应的 API：`POST /admin/api/accounts/bulk`（`{ action: 'enable' \| 'disable' \| 'reset' \| 'delete', ids }`，`delete` 必须显式给 `ids`，防止误删全部）与 `POST /admin/api/accounts/prune`。
+
+### 虚拟 Key 限额
+
+除了总量配额（`quotaRequests`）与有效期，虚拟 Key 还支持**每日请求上限**（`limitDaily`，创建或 `PATCH` 时设置）：按自然日统计当日已派发请求数，超限返回 429 并带「距本地零点」的 `retry_after`。虚拟 Key 表新增「今日 / 日限额」列，可直接看到当日用量与进度条。被限额挡下的请求不计入当日用量（否则计数永远追不上限额）。
+
+数据来自上游 `/alpha/*` 端点（未公开文档，解析层已做防御性兼容）：
+
+| 端点 | 数据 |
+|------|------|
+| `/alpha/whoami` | 账户身份 + orgId |
+| `/alpha/billing/credits` | 余额 + `windowLimits.{fiveHour,weekly}`（used/cap/exceeded/resetAt） |
+| `/alpha/billing/subscriptions` | 套餐 planId、账期结束时间（带 `?orgId=`） |
+| `/alpha/usage/summary` | 账期内请求数、成功率、tokens 进出、消耗 |
+
+要点：
+
+- **5 小时 / 周窗口取上游权威数据**；**月度是推算值**——上游没有 monthly 窗口对象，上限按套餐映射，已用 = 上限 − 月度剩余，重置点取账期结束。面板会标注「按套餐推算」，未知套餐自动隐藏该条
+- 套餐映射（社区对官方 CLI 的逆向结论，官方未文档化）：Go 10 / GOAT 70 / Pro 30 / Pro-v1 80 / Provider 15 / Max 150 / Ultra 300 / Teams Pro 40 credits
+- 字段容错：窗口与余额同时兼容 camelCase 与 snake_case（`used_credits`、`monthly_credits`、`reset_at`），时间戳兼容 epoch 秒、epoch 毫秒与 ISO 字符串
+- 视角：百分比与进度条长度都是**剩余**，颜色按**已用**比例分级（<50% 绿 / <75% 黄 / <90% 橙 / ≥90% 红）——条越短、颜色越红就代表越接近上限；重置文案按剩余时长自动切换为「X 分钟后重置 / X 小时后重置 / X 天 Y 小时后重置 / X 月 X 日重置」
+- 成功率字段上游给的是百分数（如 `100`），不是 0-1 比例，直接按百分数显示；累计 Tokens 用亿 / 万单位，单均成本保留 4 位小数
+- 额度查询**不产生副作用**：不改动账号启用状态与冷却，Key 被拒只在卡片上标红提示（与代理请求路径的判定相互独立）
+- 刷新方式：卡片上的单账号「刷新」、面板右上「刷新额度」（最多 12 个账号）、或在设置里开启「额度自动刷新」（按分钟间隔后台补刷，**默认关闭**）
+- 每次刷新会对该账号打 4 次上游请求，所以默认不做自动轮询：额度查询本身也要贴近正常 CLI 频率
+- 额度查询并发固定为 4，避免批量刷新打爆上游
+
+### 文件结构（新增部分）
+
+```
+commandcode/
+├── proxy.mjs             # 原单文件代理（仅做少量集成改动，见下）
+├── pool.mjs              # 【新增】账号池：持久化 / 调度 / 冷却 / 并发与节流 / 记账 / 虚拟 Key / 额度 / 面板鉴权
+├── admin.mjs             # 【新增】面板后端：/admin 页面与 /admin/api/* 接口
+├── public/
+│   └── admin.html        # 【新增】面板前端（原生 HTML/CSS/JS，无构建、无外部依赖）
+├── tests/                # 【新增】本地验收脚本：mock 上游 + 4 套端到端验证 + 前端完整性检查
+└── data/
+    └── pool.json         # 【运行时生成】池子状态（账号、虚拟 Key、统计、日志、额度缓存、密码哈希）
+```
+
+`proxy.mjs` 的改动集中在四处：模块导入与集成 helper、各端点入口的 Key 解析（`resolveRequestKey`）、上游拒绝时的换号循环、成功/失败路径的用量记账，以及 `/admin` 路由挂载。其余协议逻辑保持原样。
+
+### 数据与安全
+
+- `data/pool.json` 由进程**原子写入**（临时文件 + rename），内存态为准，节流落盘（2s）+ 退出时 flush
+- 管理密码使用 **scrypt** 加盐哈希存储；面板登录令牌为 **HMAC-SHA256 签名**，有效期 7 天
+- 修改密码会轮换签名密钥，**所有已签发令牌立即失效**
+- 面板列表中的账号 Key 一律**掩码显示**（`user_ok1…1111`），不提供完整 Key 回显
+- 日志与状态文件中**不含**完整上游 Key
+- 可用 `CCPOOL_DATA_DIR` 指定数据目录（默认 `./data`），便于容器挂载卷
+
+```bash
+CCPOOL_DATA_DIR=/var/lib/ccpool npm start
+```
+
+### 部署详情（Docker Compose，实测 fnOS NAS）
+
+本仓库在飞牛 fnOS NAS（Debian 12 · x86_64 · Docker 28 · Compose v2.40）上长期运行。仓库自带的 [docker-compose.yml](docker-compose.yml) 即生产形态：构建镜像、映射端口（宿主端口可用 `PROXY_PORT` 调整）、`ccpool-data` 卷持久化全部状态、内置 `/health` 健康检查（wget，30s 间隔）、`restart: unless-stopped`。
+
+```bash
+# 部署 / 升级（数据在卷里，重建容器不丢）
+docker compose up -d --build
+docker compose logs -f proxy
+
+# 换宿主端口（例如与上游官方实例 3050 共存时用 3051）
+PROXY_PORT=3051 docker compose up -d --build
+```
+
+| 事项 | 说明 |
+| --- | --- |
+| 数据持久化 | 全部运行时状态在 `ccpool-data` 卷的 `pool.json`（账号、虚拟 Key、统计、日志、密码哈希）；备份即备份该文件，升级不动它 |
+| 面板 | `http://<host>:<端口>/admin`，首次登录密码 `admin123`，登录后立即修改 |
+| 健康检查 | 容器内置（`wget /health`），宿主机亦可 `curl http://<host>:<端口>/health` |
+| 与上游共存 | 上游官方镜像占用 3050 时，本 fork 用 `PROXY_PORT=3051`，数据目录独立互不影响 |
+| 部署验证 | `BASE=http://<host>:<端口> node tests/verify.mjs`（六套共 176 项后端断言 + 74 项渲染断言，见 [tests/README.md](tests/README.md)） |
+
+NAS 变体（bind mount 更利于直接备份/查看）：把 `ccpool-data:/app/data` 换成 `./data:/app/data`。
+
+### 部署提示
+
+面板默认与代理同端口同路径。若要暴露到公网，请：
+
+- 在反向代理层为 `/admin` 增加访问控制（IP 白名单 / Basic Auth / 内网仅可达）
+- 保持 `limit_conn` 等并发限制配置（见[内存与部署](#内存与部署)）——池子解决的是**账号维度**的故障转移，不改变单进程内存模型
+- 多实例部署时**仍不可**用轮询负载均衡：`sessionStore` / 指纹是进程内的，同一上游账号打到两个实例会被上游视为两台设备。按虚拟 Key 做一致性哈希，或只跑单实例
 
 ## 开发
 

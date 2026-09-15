@@ -1,5 +1,6 @@
 node_modules/
 .git/
+.gitignore
 *.log
 .commandcode/
 .opencode/
@@ -7,3 +8,10 @@ node_modules/
 temp/
 README*.md
 AGENTS.md
+Dockerfile
+docker-compose.yml
+tests/
+
+# 绝不能进镜像：运行时状态含上游明文 Key 与面板密码哈希
+data/
+.test-data/

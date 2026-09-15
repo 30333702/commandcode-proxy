@@ -1,5 +1,7 @@
 # Command Code Proxy
 
+<p align="center"><img src="docs/logo.svg" width="88" alt="CCPool — multi-account pool proxy"></p>
+
 > [中文文档](README_zh.md)
 
 A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
@@ -613,6 +615,189 @@ This project is for **educational and research purposes** only.
 - **Account Risk**: Keep usage frequency consistent with normal CLI usage. Extremely high concurrent calls may trigger risk controls.
 
 ---
+
+## Multi-Account Pool & Admin Panel (fork addition)
+
+> This section documents the fork-specific additions over upstream
+> [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy).
+> The OpenAI / Anthropic / Responses endpoints, upstream protocol alignment, device
+> fingerprinting, idle-timeout and backpressure logic are **unchanged**.
+
+**What it adds**
+
+- **Account pool** — many upstream `user_*` keys behind one virtual downstream key (`sk-ccp-*`)
+- **Scheduling** — `round_robin` (default) / `least_used` / `random` / `sticky`; unusable and
+  out-of-quota accounts are skipped, and a fully exhausted pool answers 503 with the nearest window
+  reset time as `Retry-After`
+- **Sticky sessions** — an optional strategy that pins each virtual key to its last account to preserve
+  upstream prompt-cache hits; the binding moves automatically when that account goes unavailable or
+  runs out of quota. Pin/unpin per key from the `Pin` column on the virtual key page (or the usage-card
+  shortcut when a single key is enabled). Unpinning sets a persisted `stickyOff` flag so the strategy
+  stops re-pinning on the next request; picking an account again restores stickiness. The binding
+  persists across restarts
+- **Failover** — on upstream 401/402/403/429/5xx the request is retried on another account, transparently
+- **Health state machine** — invalid keys auto-disabled, rate limits cooled down (honours `Retry-After`), auto-recovery
+- **Usage accounting** — per account / per virtual key / daily, 30-day retention
+- **Usage limits** — per-account 5-hour / weekly / monthly quota bars with reset countdowns
+- **Concurrency & throttle guards** — per-account in-flight cap and minimum dispatch interval to stay
+  close to normal CLI frequency and avoid upstream risk control
+- **Web panel** — account CRUD, key issuing, request logs (full view with today / yesterday / 24h /
+  7d / 14d / 30d / this month / last month filters plus custom date range), settings, password
+
+**Quick start**
+
+```bash
+npm start
+```
+
+1. Open `http://127.0.0.1:3050/admin` (same port as the proxy)
+2. Default password `admin123` — change it in **Settings** right after first login
+3. Add one or more `user_*` keys under **Upstream Accounts** (one per line)
+4. Create an `sk-ccp-*` key under **Virtual Keys**
+5. Point your client at this proxy and use that virtual key
+
+**Client usage**
+
+```bash
+curl http://127.0.0.1:3050/v1/chat/completions \
+  -H "Authorization: Bearer sk-ccp-xxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Backward compatible: sending an upstream `user_*` key directly still works and **bypasses the pool**
+(identical to upstream behaviour, not counted in pool statistics). Both modes can coexist.
+
+**New files**
+
+```
+pool.mjs          # pool core: persistence, scheduling, cooldown, concurrency/throttle, accounting,
+                  #            vkeys, usage limits, panel auth
+admin.mjs         # panel backend: /admin page + /admin/api/* endpoints
+public/admin.html # panel frontend (vanilla HTML/CSS/JS, no build step, no external deps)
+tests/            # local acceptance scripts: mock upstream + 4 e2e suites + panel integrity check
+data/pool.json    # runtime state (git-ignored): accounts, virtual keys, stats, logs, usage cache, password hash
+```
+
+**Usage Limits**
+
+The dashboard shows one card per upstream account with three quota windows, mirroring the official
+usage panel. Both the percentage and the bar length express **remaining** quota, while the colour
+grades on **used** ratio — so a short, red bar means the account is close to its cap:
+
+```
+Main account  [Go]                  Details  Refresh  Delete
+Monthly left 4.1    Purchased 0    Free 0
+5-Hour Limit                      remaining 89.8%
+███████████████████████░░
+used 0.4 / 3               left 2.6 · resets in 3h 56m
+Weekly Limit                      remaining 3.2%
+█░░░░░░░░░░░░░░░░░░░░░░░░░
+used 5.8 / 6               left 0.2 · resets in 5d 0h
+Monthly Limit                     remaining 41.9%   cap from plan
+███████████░░░░░░░░░░░░░░░
+used 5.8 / 10              left 4.2 · resets in 28d 0h
+```
+
+"Details" expands the account's billing-period statistics from `/alpha/usage/summary`: total
+requests, success rate, completed / failed, credits spent, tokens in / out, average cost, and the
+period basis (e.g. `billing-period`). Each card also has Pin / Unpin (manual sticky binding),
+Refresh, and Delete. Newly added accounts are usage-fetched automatically, so their cards fill in
+within a few seconds.
+
+**Burn forecast**: the 5-hour and weekly windows estimate when they will hit the cap, based on the
+average burn rate inside the current window (`expected to fill in 2h 24m`). It only appears once the
+window is at least 5 minutes old and the current rate would exhaust the window before it resets;
+the monthly window follows the billing period and is left unpredicted.
+
+**Usage distribution**: the dashboard ranks the last 7 days of traffic by virtual key and by model
+(switchable) — requests, success rate, tokens, with bar lengths proportional to share. The data comes
+from per-day `byKey` / `byModel` buckets kept for 7 days, no extra database required.
+
+**Bulk account operations**: enable all, disable all, and prune — the last deletes accounts that are
+both disabled and auth-broken (401/403), and clears any sticky bindings pointing at them. Exposed as
+`POST /admin/api/accounts/bulk` (`enable` / `disable` / `reset` / `delete`; `delete` requires explicit
+ids) and `POST /admin/api/accounts/prune`.
+
+**Virtual key limits**: besides a total request quota and expiry, a key can carry a per-day request
+cap (`limitDaily`). Over-limit requests get 429 with a `retry_after` pointing at local midnight, and
+the key table shows a today / daily-limit column with a progress bar. Requests rejected by the limit
+are not counted, so the counter can never chase the cap.
+
+Data comes from the upstream `/alpha/*` endpoints (undocumented; the parser is defensive):
+
+| Endpoint | Data |
+|----------|------|
+| `/alpha/whoami` | account identity + orgId |
+| `/alpha/billing/credits` | credits + `windowLimits.{fiveHour,weekly}` (used/cap/exceeded/resetAt) |
+| `/alpha/billing/subscriptions` | planId, period end (`?orgId=`) |
+| `/alpha/usage/summary` | per-period request count, success rate, tokens, spend |
+
+- The 5-hour and weekly windows are **authoritative upstream data**. **Monthly is derived**: upstream
+  has no monthly window object, so the cap comes from a plan mapping, used = cap − monthly remaining,
+  and the reset point is the period end. The UI labels it "estimated from plan" and hides the row for
+  unknown plans
+- Plan mapping (community reverse-engineering of the official CLI, undocumented): Go 10 / GOAT 70 /
+  Pro 30 / Pro-v1 80 / Provider 15 / Max 150 / Ultra 300 / Teams Pro 40 credits
+- Parser tolerates camelCase and snake_case (`used_credits`, `monthly_credits`, `reset_at`) and epoch
+  seconds, epoch milliseconds, or ISO strings for timestamps
+- Bars and percentages express remaining quota; colour grades on used ratio (<50% green / <75% yellow
+  / <90% orange / ≥90% red)
+- Upstream reports `successRate` as a percentage (e.g. `100`), not a 0-1 ratio; token totals use 亿/万
+  units and average cost keeps 4 decimals
+- Usage queries have **no side effects**: they never change account enablement or cooldown; a rejected
+  key is only flagged on the card
+- Refresh individually, refresh all (up to 12 accounts), or enable "usage auto refresh" (default off).
+  Each refresh costs 4 upstream requests per account, so polling is off by default
+
+**Deployment note**: the `ghcr.io/maxeaglet/commandcode-proxy` image is built by the *upstream*
+repository and does **not** include the pool or panel. Build from source for the fork, and mount a
+volume at `/app/data` (`CCPOOL_DATA_DIR`) or the pool state is lost on container recreation.
+
+`proxy.mjs` changes are limited to: module imports + integration helpers, key resolution at each
+endpoint entry, the failover retry loop, usage accounting on success/failure paths, and mounting
+the `/admin` route.
+
+**Data & security**
+
+- `data/pool.json` is written **atomically** (temp file + rename), memory-first with 2s throttled flush + flush on exit
+- Admin password stored as salted **scrypt** hash; panel tokens are **HMAC-SHA256** signed, 7-day TTL
+- Changing the password rotates the signing secret — all issued tokens are invalidated immediately
+- Account keys are always **masked** in the panel; full keys are never echoed back
+- Full upstream keys are never written to logs
+- Data directory override: `CCPOOL_DATA_DIR=/var/lib/ccpool npm start`
+
+**Deployment notes**
+
+- Protect `/admin` at the reverse proxy (IP allowlist / Basic Auth) if exposed publicly
+- Keep the `limit_conn` guidance from [Memory & Deployment](#memory--deployment) — the pool adds
+  *account-level* failover, it does not change the single-process memory model
+- **Still no round-robin load balancing** across instances: `sessionStore` and fingerprints are
+  in-process, so one upstream account hitting two instances looks like two devices to upstream
+
+### Deployment details (Docker Compose, tested on fnOS NAS)
+
+This fork runs long-term on a fnOS NAS (Debian 12 · x86_64 · Docker 28 · Compose v2.40). The
+[docker-compose.yml](docker-compose.yml) in this repo is the production shape: image build, port
+mapping (host port via `PROXY_PORT`), a `ccpool-data` volume persisting all state, a built-in
+`/health` check (wget, every 30s), and `restart: unless-stopped`.
+
+```bash
+docker compose up -d --build          # deploy / upgrade (data survives container recreation)
+docker compose logs -f proxy
+
+PROXY_PORT=3051 docker compose up -d --build   # e.g. coexisting with the upstream image on 3050
+```
+
+| Item | Notes |
+| --- | --- |
+| Persistence | All runtime state lives in `pool.json` inside the `ccpool-data` volume (accounts, keys, stats, logs, password hash); back up that one file, upgrades leave it alone |
+| Panel | `http://<host>:<port>/admin`, first-login password `admin123` — change it right away |
+| Health | Built into the image (`wget /health`); from the host: `curl http://<host>:<port>/health` |
+| Coexistence | Upstream image on 3050? Run this fork with `PROXY_PORT=3051`, separate data |
+| Verification | `BASE=http://<host>:<port> node tests/verify.mjs` (six suites, 176 backend assertions + 74 render assertions, see [tests/README.md](tests/README.md)) |
+
+NAS variant: swap `ccpool-data:/app/data` for `./data:/app/data` to keep the state file visible in the project folder.
 
 ## Development
 
